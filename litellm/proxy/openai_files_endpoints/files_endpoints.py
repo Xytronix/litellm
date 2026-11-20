@@ -91,6 +91,7 @@ from litellm.proxy.openai_files_endpoints.common_utils import (  # noqa: F401  #
     handle_model_based_routing,
     is_base64_encoded_unified_file_id,
     prepare_data_with_credentials,
+    provider_file_id_spellings,
     provider_upload_model_id,
     validate_file_list_limit,
     validate_managed_files_requirement,
@@ -445,7 +446,15 @@ async def _forget_recorded_owner(proxy_logging_obj: ProxyLogging, file_id: str) 
     managed_files_obj: Final = proxy_logging_obj.get_proxy_hook("managed_files")
     if not has_attributes(managed_files_obj, _CarriesPrismaClient, "prisma_client"):
         return
-    await ManagedFileRepository(managed_files_obj.prisma_client).table.delete_many(where={"unified_file_id": file_id})
+    file_id_spellings: Final = list(provider_file_id_spellings(file_id))
+    await ManagedFileRepository(managed_files_obj.prisma_client).table.delete_many(
+        where={
+            "OR": [
+                {"unified_file_id": {"in": file_id_spellings}},
+                {"flat_model_file_ids": {"hasSome": file_id_spellings}},
+            ]
+        }
+    )
 
 
 async def route_create_file(
@@ -544,7 +553,7 @@ async def route_create_file(
             )
 
             # Create the file with model credentials
-            response = await litellm.acreate_file(
+            response: OpenAIFileObject = await litellm.acreate_file(
                 **upload_request,
                 custom_llm_provider=credentials["custom_llm_provider"],
             )
@@ -610,7 +619,9 @@ async def route_create_file(
         _create_file_request.update(llm_provider_config)
     _create_file_request.pop("custom_llm_provider", None)
     # for now use custom_llm_provider=="openai" -> this will change as LiteLLM adds more providers for acreate_batch
-    provider_file: Final = await litellm.acreate_file(**_create_file_request, custom_llm_provider=custom_llm_provider)
+    provider_file: Final[OpenAIFileObject] = await litellm.acreate_file(
+        **_create_file_request, custom_llm_provider=custom_llm_provider
+    )
     return await _with_recorded_owner(
         provider_file,
         provider_file.id,

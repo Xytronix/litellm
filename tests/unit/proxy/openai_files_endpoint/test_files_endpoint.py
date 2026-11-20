@@ -6524,6 +6524,8 @@ def test_raw_provider_file_id_still_goes_to_the_hinted_model_when_managed_files_
 
 
 _PLAIN_UPLOAD_ID: Final = "file-team-a-payroll"
+_GEMINI_FILE_URI: Final = "https://generativelanguage.googleapis.com/v1beta/files/gemini-team-a-file"
+_GEMINI_FILE_ID: Final = "gemini-team-a-file"
 
 
 @dataclass(frozen=True, slots=True)
@@ -6641,6 +6643,27 @@ def _listed_ids(response: httpx.Response) -> list[str]:
     return [file["id"] for file in response.json()["data"]]
 
 
+def _stored_owner_file_row(
+    unified_file_id: str, model_key: str, model_file_id: str, flat_file_id: str
+) -> LiteLLM_ManagedFileTable:
+    return LiteLLM_ManagedFileTable(
+        unified_file_id=unified_file_id,
+        file_object=OpenAIFileObject(
+            id=unified_file_id,
+            object="file",
+            bytes=15,
+            created_at=1234567890,
+            filename="owner-file.jsonl",
+            purpose="user_data",
+            status="processed",
+        ),
+        model_mappings={model_key: model_file_id},
+        flat_model_file_ids=[flat_file_id],
+        created_by="user-a",
+        team_id="team-a",
+    )
+
+
 @_SHARED_ACCOUNTS
 def test_another_team_cannot_list_read_or_delete_a_plain_upload(
     plain_upload_proxy: _ManagedFileTableOverRows, account: _SharedAccount
@@ -6697,6 +6720,93 @@ def test_the_uploading_team_lists_reads_and_deletes_its_plain_upload(
     assert deleted.status_code == 200, deleted.text
     assert shared_account["delete"].call_count == 1
     assert _listed_ids(listed_after_delete) == []
+
+
+def test_owner_delete_by_bare_gemini_id_removes_full_uri_row_and_preserves_sibling(
+    plain_upload_proxy: _ManagedFileTableOverRows, mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch
+):
+    plain_upload_proxy.rows.extend(
+        (
+            _stored_owner_file_row(
+                _GEMINI_FILE_URI, "gemini-2.0-flash-id", _GEMINI_FILE_URI, _GEMINI_FILE_ID
+            ),
+            _stored_owner_file_row(
+                "sibling-unified-id", "gpt-3.5-turbo-id", "sibling-provider-id", "sibling-provider-id"
+            ),
+        )
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.openai_files_endpoints.files_endpoints.files_config",
+        [{"custom_llm_provider": "gemini", "api_key": "sk-gemini-shared-account"}],
+    )
+    provider_delete = mocker.patch(
+        "litellm.afile_delete",
+        new=mocker.AsyncMock(
+            return_value={"id": _GEMINI_FILE_ID, "object": "file", "deleted": True}
+        ),
+    )
+    headers: Final = _as_team_member("user-a", "team-a")
+
+    listed_before: Final = client.get("/v1/files", headers=headers)
+    deleted: Final = client.delete(f"/v1/files/{_GEMINI_FILE_ID}?provider=gemini", headers=headers)
+    listed_after: Final = client.get("/v1/files", headers=headers)
+
+    assert set(_listed_ids(listed_before)) == {_GEMINI_FILE_URI, "sibling-unified-id"}
+    assert deleted.status_code == 200, deleted.text
+    provider_delete.assert_awaited_once()
+    assert provider_delete.await_args.kwargs["custom_llm_provider"] == "gemini"
+    assert provider_delete.await_args.kwargs["file_id"] == _GEMINI_FILE_ID
+    assert _listed_ids(listed_after) == ["sibling-unified-id"]
+
+
+@pytest.mark.parametrize("id_kind", ["raw provider id", "model-routed id"])
+def test_owner_delete_by_either_model_routed_id_removes_only_its_row(
+    plain_upload_proxy: _ManagedFileTableOverRows, id_kind: str
+):
+    plain_upload_proxy.rows.append(
+        _stored_owner_file_row(
+            "sibling-unified-id", "gpt-3.5-turbo-id", "sibling-provider-id", "sibling-provider-id"
+        )
+    )
+
+    with respx.mock(assert_all_called=False) as upstream:
+        shared_account: Final = _mock_shared_account(upstream, _OPENAI_ACCOUNT)
+        uploaded: Final = _upload_payroll_through_the_shared_model_as_team_a()
+        routed_id: Final = uploaded.json()["id"]
+        file_id: Final = _PLAIN_UPLOAD_ID if id_kind == "raw provider id" else routed_id
+        deleted: Final = client.delete(
+            f"/v1/files/{file_id}?model=gpt-3.5-turbo",
+            headers=_as_team_member("user-a", "team-a"),
+        )
+        listed_after: Final = client.get("/v1/files", headers=_as_team_member("user-a", "team-a"))
+
+    assert uploaded.status_code == 200, uploaded.text
+    assert routed_id != _PLAIN_UPLOAD_ID
+    assert deleted.status_code == 200, deleted.text
+    assert shared_account["delete"].call_count == 1
+    assert _listed_ids(listed_after) == ["sibling-unified-id"]
+
+
+def test_provider_delete_failure_keeps_the_owner_file_listed(
+    plain_upload_proxy: _ManagedFileTableOverRows, mocker: MockerFixture
+):
+    with respx.mock(assert_all_called=False) as upstream:
+        _mock_shared_account(upstream, _OPENAI_ACCOUNT)
+        uploaded: Final = _upload_payroll_as_team_a(_OPENAI_ACCOUNT)
+        provider_delete = mocker.patch(
+            "litellm.afile_delete",
+            new=mocker.AsyncMock(side_effect=httpx.ConnectError("provider unavailable")),
+        )
+        deleted: Final = client.delete(
+            f"/v1/files/{_PLAIN_UPLOAD_ID}?provider=openai",
+            headers=_as_team_member("user-a", "team-a"),
+        )
+        listed_after: Final = client.get("/v1/files", headers=_as_team_member("user-a", "team-a"))
+
+    assert uploaded.status_code == 200, uploaded.text
+    assert deleted.status_code == 500, deleted.text
+    provider_delete.assert_awaited_once()
+    assert _listed_ids(listed_after) == [_PLAIN_UPLOAD_ID]
 
 
 def _upload_payroll_through_the_shared_model_as_team_a() -> httpx.Response:
