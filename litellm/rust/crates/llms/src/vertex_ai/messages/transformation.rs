@@ -35,7 +35,7 @@ use crate::{
         messages::{
             context::{MessagesShapeOptions, MessagesTransformContext},
             normalization::{normalize_system_role_messages, strip_cache_control_scope},
-            transformation::BaseMessagesConfig,
+            transformation::{MessagesAuth, MessagesDialect, MessagesEndpoint, MessagesReply},
         },
     },
     vertex_ai::{
@@ -60,13 +60,25 @@ pub struct VertexAiMessagesConfig;
 
 pub const VERTEX_AI_MESSAGES_CONFIG: VertexAiMessagesConfig = VertexAiMessagesConfig;
 
-impl BaseMessagesConfig for VertexAiMessagesConfig {
-    fn tool_custom_field(&self, model: &str) -> crate::base_llm::messages::tools::ToolCustomField {
-        crate::base_llm::messages::tools::ToolCustomField::Rewrite {
-            hoist_defer_loading: crate::anthropic::messages::transformation::is_claude_model(model),
-        }
+impl MessagesEndpoint for VertexAiMessagesConfig {
+    fn get_complete_url(
+        &self,
+        api_base: Option<&str>,
+        model: &str,
+        litellm_params: &LitellmParams,
+        stream: bool,
+        env_lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<String, Error> {
+        let config = VertexConfig::from_params(&litellm_params.vertex);
+        let project = get_vertex_ai_project(&config, env_lookup)
+            .or_else(|| get_vertex_ai_project_from_credentials(&config, env_lookup))
+            .ok_or_else(|| Error::Auth(VertexParams::PROJECT.missing("Vertex AI")))?;
+        let location = vertex_region(vertex_location(&litellm_params.vertex, env_lookup), &[]);
+        complete_vertex_anthropic_url(api_base, &project, &location, model, stream)
     }
+}
 
+impl MessagesAuth for VertexAiMessagesConfig {
     fn secret_names(&self) -> &'static [&'static str] {
         secret_names()
     }
@@ -96,29 +108,21 @@ impl BaseMessagesConfig for VertexAiMessagesConfig {
             },
         })
     }
+}
 
-    fn get_complete_url(
-        &self,
-        api_base: Option<&str>,
-        model: &str,
-        litellm_params: &LitellmParams,
-        stream: bool,
-        env_lookup: &dyn Fn(&str) -> Option<String>,
-    ) -> Result<String, Error> {
-        let config = VertexConfig::from_params(&litellm_params.vertex);
-        let project = get_vertex_ai_project(&config, env_lookup)
-            .or_else(|| get_vertex_ai_project_from_credentials(&config, env_lookup))
-            .ok_or_else(|| Error::Auth(VertexParams::PROJECT.missing("Vertex AI")))?;
-        let location = vertex_region(vertex_location(&litellm_params.vertex, env_lookup), &[]);
-        complete_vertex_anthropic_url(api_base, &project, &location, model, stream)
-    }
-
+impl MessagesDialect for VertexAiMessagesConfig {
     fn shape_request(
         &self,
         request: MessagesRequest,
         options: MessagesShapeOptions,
     ) -> Result<MessagesRequest, Error> {
         shape_anthropic_messages_request(request, options)
+    }
+
+    fn tool_custom_field(&self, model: &str) -> crate::base_llm::messages::tools::ToolCustomField {
+        crate::base_llm::messages::tools::ToolCustomField::Rewrite {
+            hoist_defer_loading: crate::anthropic::messages::transformation::is_claude_model(model),
+        }
     }
 
     fn transform_anthropic_messages_request(
@@ -220,7 +224,9 @@ impl BaseMessagesConfig for VertexAiMessagesConfig {
         }
         body
     }
+}
 
+impl MessagesReply for VertexAiMessagesConfig {
     fn retry_after_http_error(
         &self,
         status: u16,
