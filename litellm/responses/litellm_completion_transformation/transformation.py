@@ -82,6 +82,7 @@ from litellm.litellm_core_utils.prompt_templates.mid_conversation_system import 
     message_field,
     parts_of,
 )
+from litellm.litellm_core_utils.tool_name_truncation import namespaced_tool_name
 from litellm.llms.anthropic.common_utils import (
     anthropic_server_tool_call_params,
     anthropic_server_tool_calls,
@@ -2943,7 +2944,7 @@ class LiteLLMCompletionResponsesConfig:
         qualify: Final = bool(namespace) and not deferred_top_level and function_call.get("type") != "custom_tool_call"
         tool_call_id: Final = function_call.get("call_id") or function_call.get("id") or ""
         tool_call_function: Final = ChatCompletionToolCallFunctionChunk(
-            name=f"{namespace}__{raw_name}" if qualify else raw_name,
+            name=namespaced_tool_name(namespace, raw_name) if qualify else raw_name,
             arguments=serialize_tool_call_arguments(raw_arguments),
         )
         function_call_cache_control: Final = _input_item_cache_control(function_call)
@@ -3131,7 +3132,7 @@ class LiteLLMCompletionResponsesConfig:
             parameters if parameters and "type" in parameters else MappingProxyType({**parameters, "type": "object"})
         )
         tool_name: Final = str(namespace_tool.get("name") or "")
-        chat_tool_name: Final = f"{namespace}__{tool_name}" if nested else tool_name
+        chat_tool_name: Final = namespaced_tool_name(namespace, tool_name) if nested else tool_name
         function: Final = ChatCompletionToolParamFunctionChunk(
             name=chat_tool_name,
             description=description,
@@ -3174,20 +3175,38 @@ class LiteLLMCompletionResponsesConfig:
         top_level_function_names: Final = frozenset(
             str(tool.get("name") or "") for tool in tools or () if tool.get("type") == "function"
         )
-        flattened_namespace_names: Final = frozenset(
-            f"{(tool.get('name') or '')!s}__{(namespace_tool.get('name') or '')!s}"
+        namespace_members: Final = frozenset(
+            (str(tool.get("name") or ""), member_name)
             for tool in tools or ()
             if tool.get("type") == "namespace"
-            for namespace_tools in (tool.get("tools"),)
-            if isinstance(namespace_tools, Sequence) and not isinstance(namespace_tools, (str, bytes))
-            for namespace_tool in namespace_tools
-            if isinstance(namespace_tool, Mapping) and namespace_tool.get("type") == "function"
+            for member_name in LiteLLMCompletionResponsesConfig._namespace_member_names(tool)
         )
-        conflicting_tool_names: Final = top_level_function_names & flattened_namespace_names
+        chat_and_joined_names: Final = sorted(
+            (namespaced_tool_name(namespace, member_name), f"{namespace}__{member_name}")
+            for namespace, member_name in namespace_members
+        )
+        joined_names_by_chat_name: Final = MappingProxyType(
+            {
+                chat_name: frozenset(joined_name for _, joined_name in group)
+                for chat_name, group in groupby(chat_and_joined_names, key=lambda names: names[0])
+            }
+        )
+        conflicting_tool_names: Final = top_level_function_names & joined_names_by_chat_name.keys()
         if conflicting_tool_names:
             raise ValueError(
                 "Top-level function names conflict with flattened namespace tools: "
                 + ", ".join(sorted(conflicting_tool_names))
+            )
+        shortened_collisions: Final = sorted(
+            chat_name for chat_name, joined_names in joined_names_by_chat_name.items() if len(joined_names) > 1
+        )
+        if shortened_collisions:
+            raise ValueError(
+                "Namespace tools shorten to the same tool name: "
+                + "; ".join(
+                    f"{chat_name} ({', '.join(sorted(joined_names_by_chat_name[chat_name]))})"
+                    for chat_name in shortened_collisions
+                )
             )
 
     @staticmethod
@@ -3390,7 +3409,8 @@ class LiteLLMCompletionResponsesConfig:
             if tool_name not in top_level_function_names and unqualified_counts[tool_name] == 1
         )
         qualified_entries: Final = tuple(
-            (f"{namespace}__{tool_name}", (namespace, tool_name)) for namespace, tool_name in namespace_entries
+            (namespaced_tool_name(namespace, tool_name), (namespace, tool_name))
+            for namespace, tool_name in namespace_entries
         )
         # The OpenAI Agents SDK reserves namespace == name for a deferred top-level tool (agents/_tool_identity.py)
         deferred_top_level_entries: Final = tuple(
